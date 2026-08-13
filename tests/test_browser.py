@@ -22,3 +22,16 @@ def test_print_preferences_target_partial_file(tmp_path: Path) -> None:
     assert preferences["print.always_print_silent"] is True
     assert preferences["print.print_to_filename"] == str(output.resolve())
     assert preferences["print.save_as_pdf.use_page_rule_size_as_paper_size.enabled"] is True
+
+
+def test_download_uses_guest_option_without_profile(
+    monkeypatch, tmp_path: Path
+) -> None:
+    options = launch_options(
+        guest=True,
+        headless=True,
+        print_path=tmp_path / ".book.partial.pdf",
+    )
+    assert options["main_world_eval"] is True
+    assert "user_data_dir" not in options
+    assert "firefox_user_prefs" in options
