@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from contextlib import suppress
 from pathlib import Path
 
 from camoufox.async_api import AsyncCamoufox
@@ -89,16 +90,24 @@ async def download(
     guest: bool,
     progress: ProgressCallback | None = None,
 ) -> Path:
-    ref = parse_document_url(url)
-    base_dir = output.expanduser().resolve().parent if output else Path.cwd()
-    base_dir.mkdir(parents=True, exist_ok=True)
-    partial = (
-        partial_pdf_path(output.expanduser().resolve())
-        if output
-        else base_dir / f".{ref.document_id}.partial.pdf"
-    )
-    partial.unlink(missing_ok=True)
+    partial: Path | None = None
     try:
+        ref = parse_document_url(url)
+        try:
+            resolved_output = output.expanduser().resolve() if output else None
+            base_dir = resolved_output.parent if resolved_output else Path.cwd()
+            base_dir.mkdir(parents=True, exist_ok=True)
+            partial = (
+                partial_pdf_path(resolved_output)
+                if resolved_output
+                else base_dir / f".{ref.document_id}.partial.pdf"
+            )
+            partial.unlink(missing_ok=True)
+        except Exception as error:
+            raise DownloaderError(
+                f"output: failed to prepare destination ({error})"
+            ) from error
+
         async with AsyncCamoufox(
             **launch_options(guest=guest, headless=True, print_path=partial)
         ) as browser_or_context:
@@ -111,23 +120,32 @@ async def download(
                         f"{error}; run `scribd-downloader login` and retry without --guest"
                     ) from error
                 raise
-            final_output = (
-                output.expanduser().resolve()
-                if output
-                else (
-                    Path.cwd()
-                    / default_output_path(info.title, info.document_id)
-                ).resolve()
-            )
-            final_output.parent.mkdir(parents=True, exist_ok=True)
+            if resolved_output:
+                final_output = resolved_output
+            else:
+                try:
+                    final_output = (
+                        Path.cwd()
+                        / default_output_path(info.title, info.document_id)
+                    ).resolve()
+                    final_output.parent.mkdir(parents=True, exist_ok=True)
+                except Exception as error:
+                    raise DownloaderError(
+                        f"output: failed to prepare destination ({error})"
+                    ) from error
             await prepare_print_dom(page, info)
             await page.evaluate("mw:window.print()")
             await wait_for_pdf(partial)
-            finalize_pdf(partial, final_output, info.page_count)
-            return final_output
+
+        finalize_pdf(partial, final_output, info.page_count)
+        return final_output
     except DownloaderError:
-        partial.unlink(missing_ok=True)
+        if partial is not None:
+            with suppress(OSError):
+                partial.unlink(missing_ok=True)
         raise
     except Exception as error:
-        partial.unlink(missing_ok=True)
+        if partial is not None:
+            with suppress(OSError):
+                partial.unlink(missing_ok=True)
         raise DownloaderError(f"browser: download failed ({error})") from error
