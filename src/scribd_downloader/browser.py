@@ -21,6 +21,11 @@ PROFILE_DIR = Path.home() / ".scribd-downloader" / "profile"
 LOGIN_URL = "https://www.scribd.com/login"
 
 
+def prepare_profile() -> None:
+    PROFILE_DIR.mkdir(parents=True, mode=0o700, exist_ok=True)
+    PROFILE_DIR.chmod(0o700)
+
+
 def print_preferences(output: Path) -> dict[str, object]:
     filename = str(output.resolve())
     prefix = "print.printer_Mozilla_Save_to_PDF"
@@ -68,8 +73,8 @@ def launch_options(
 
 
 async def login() -> None:
-    PROFILE_DIR.mkdir(parents=True, exist_ok=True)
     try:
+        prepare_profile()
         async with AsyncCamoufox(**launch_options(guest=False, headless=False)) as context:
             page = await context.new_page()
             await page.goto(LOGIN_URL, wait_until="domcontentloaded", timeout=120_000)
@@ -108,6 +113,8 @@ async def download(
                 f"output: failed to prepare destination ({error})"
             ) from error
 
+        if not guest:
+            prepare_profile()
         async with AsyncCamoufox(
             **launch_options(guest=guest, headless=True, print_path=partial)
         ) as browser_or_context:

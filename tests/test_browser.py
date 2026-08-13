@@ -1,4 +1,5 @@
 import asyncio
+import stat
 from pathlib import Path
 
 import pytest
@@ -38,6 +39,19 @@ def test_guest_launch_has_no_profile() -> None:
     options = launch_options(guest=True, headless=True)
     assert "persistent_context" not in options
     assert "user_data_dir" not in options
+
+
+def test_prepare_profile_tightens_existing_directory_permissions(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    profile = tmp_path / "profile"
+    profile.mkdir(mode=0o755)
+    profile.chmod(0o755)
+    monkeypatch.setattr(browser_module, "PROFILE_DIR", profile)
+
+    browser_module.prepare_profile()
+
+    assert stat.S_IMODE(profile.stat().st_mode) == 0o700
 
 
 def test_print_preferences_target_partial_file(tmp_path: Path) -> None:

@@ -1,5 +1,7 @@
 import asyncio
+import json
 import re
+import subprocess
 from types import SimpleNamespace
 
 import pytest
@@ -8,6 +10,7 @@ from playwright.async_api import Error as PlaywrightError
 from scribd_downloader import DownloaderError
 from scribd_downloader.scribd import (
     DocumentInfo,
+    LOAD_BATCH_SCRIPT,
     ResourceMonitor,
     parse_document_url,
     prepare_print_dom,
@@ -15,6 +18,19 @@ from scribd_downloader.scribd import (
     validate_document_state,
     wait_for_manager,
 )
+
+
+def run_javascript(script: str) -> list[str]:
+    from playwright._impl._driver import compute_driver_executable
+
+    node, _ = compute_driver_executable()
+    completed = subprocess.run(
+        [str(node), "-e", script],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    return json.loads(completed.stdout)
 
 
 def test_parse_document_url_accepts_document_page() -> None:
@@ -82,6 +98,18 @@ def test_resource_monitor_keeps_page_asset_failure() -> None:
     assert monitor.failures[0].kind == "page"
 
 
+def test_resource_monitor_removes_asset_secrets_from_diagnostics() -> None:
+    monitor = ResourceMonitor()
+    monitor.record_failure(
+        "https://html.scribdassets.com/abc/pages/3-page.jsonp?token=fake-secret#viewer",
+        "script",
+        "HTTP 503",
+    )
+    failure = monitor.failures[0]
+    assert failure.url == "html.scribdassets.com/abc/pages/3-page.jsonp"
+    assert "fake-secret" not in repr(failure)
+
+
 def test_resource_monitor_ignores_viewer_ui_font_failure() -> None:
     monitor = ResourceMonitor()
     monitor.record_failure(
@@ -114,6 +142,52 @@ def test_wait_for_manager_retries_context_destruction() -> None:
     state = asyncio.run(wait_for_manager(page, timeout_seconds=1))  # type: ignore[arg-type]
     assert state["pageCount"] == 1
     assert page.calls == 2
+
+
+def test_wait_for_manager_waits_for_all_registered_pages() -> None:
+    class Page:
+        calls = 0
+
+        async def evaluate(self, script: str) -> dict[str, object]:
+            self.calls += 1
+            registered_pages = 1 if self.calls == 1 else 5
+            return {
+                "title": "Sample",
+                "pageCount": 5,
+                "sizes": [[612, 792]] * registered_pages,
+                "missing": [],
+            }
+
+    page = Page()
+    state = asyncio.run(wait_for_manager(page, timeout_seconds=1))  # type: ignore[arg-type]
+    assert len(state["sizes"]) == 5
+    assert page.calls == 2
+
+
+def test_load_batch_awaits_fonts_for_prestarted_pages() -> None:
+    load_batch = LOAD_BATCH_SCRIPT.removeprefix("mw:")
+    calls = run_javascript(
+        f"""
+const calls = [];
+const page = {{
+  pageNum: 1,
+  innerPageElem: {{isConnected: true}},
+  loadHasStarted: true,
+  load() {{ calls.push("load"); }},
+  async loadFonts() {{
+    calls.push("fonts-start");
+    await Promise.resolve();
+    calls.push("fonts-done");
+  }},
+  display() {{ calls.push("display"); }},
+  turnOnImages() {{ calls.push("images"); }},
+}};
+global.window = {{docManager: {{pages: {{1: page}}}}}};
+const loadBatch = eval("(" + {json.dumps(load_batch)} + ")");
+loadBatch({{start: 0, end: 1}}).then(() => console.log(JSON.stringify(calls)));
+"""
+    )
+    assert calls == ["fonts-start", "fonts-done", "display", "images"]
 
 
 def test_render_document_translates_navigation_failure() -> None:

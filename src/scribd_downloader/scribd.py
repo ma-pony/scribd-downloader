@@ -93,7 +93,9 @@ class ResourceMonitor:
     def record_failure(self, url: str, resource_type: str, detail: str) -> None:
         kind = self.classify(url, resource_type)
         if kind is not None:
-            self.failures.append(ResourceFailure(kind, url, detail))
+            parsed = urlsplit(url)
+            location = f"{parsed.hostname or 'unknown-host'}{parsed.path or '/'}"
+            self.failures.append(ResourceFailure(kind, location, detail))
 
     def attach(self, page: Page) -> None:
         def on_response(response: Response) -> None:
@@ -140,11 +142,12 @@ LOAD_BATCH_SCRIPT = r"""mw:async ({start, end}) => {
   const pages = Object.values(manager.pages || {}).filter(Boolean).sort((a, b) => a.pageNum - b.pageNum);
   const batch = pages.slice(start, end);
   await Promise.all(batch.map(async (page) => {
-    if (page.innerPageElem || page.loadHasStarted) return;
     const fontResult = page.loadFonts();
     if (fontResult && typeof fontResult.then === "function") await fontResult;
-    const loadResult = page.load();
-    if (loadResult && typeof loadResult.then === "function") await loadResult;
+    if (!page.innerPageElem && !page.loadHasStarted) {
+      const loadResult = page.load();
+      if (loadResult && typeof loadResult.then === "function") await loadResult;
+    }
   }));
   const deadline = Date.now() + 45000;
   while (batch.some((page) => !page.innerPageElem || !page.innerPageElem.isConnected)) {
@@ -183,10 +186,18 @@ async def wait_for_manager(page: Page, timeout_seconds: float = 60) -> dict[str,
                 raise DownloaderError(f"render: Scribd initialization failed: {detail}") from error
             await asyncio.sleep(0.25)
             continue
-        if last_state.get("pageCount") and not last_state.get("missing"):
+        page_count = int(last_state.get("pageCount") or 0)
+        sizes = last_state.get("sizes") or []
+        if page_count and len(sizes) == page_count and not last_state.get("missing"):
             return last_state
         await asyncio.sleep(0.25)
-    missing = ", ".join(last_state.get("missing", [])) or "window.docManager"
+    missing = ", ".join(last_state.get("missing", []))
+    if not missing and last_state.get("pageCount"):
+        missing = (
+            f"registered {len(last_state.get('sizes') or [])}/"
+            f"{last_state['pageCount']} pages"
+        )
+    missing = missing or "window.docManager"
     raise DownloaderError(f"render: Scribd initialization timed out ({missing})")
 
 
