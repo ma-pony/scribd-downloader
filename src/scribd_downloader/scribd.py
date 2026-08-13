@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from typing import Any, Callable
 from urllib.parse import urlsplit
 
+from playwright.async_api import Error as PlaywrightError
 from playwright.async_api import Page, Request, Response
 
 from scribd_downloader import DownloaderError
@@ -63,7 +64,10 @@ def validate_document_state(document_id: str, state: dict[str, Any]) -> Document
     if page_count < 1 or len(sizes) != page_count:
         raise DownloaderError("render: Scribd did not expose every document page")
     width, height = sizes[0]
-    return DocumentInfo(document_id, str(state.get("title") or "").strip(), page_count, width, height)
+    title = str(state.get("title") or "").strip()
+    if title.casefold() == "scribd":
+        title = ""
+    return DocumentInfo(document_id, title, page_count, width, height)
 
 
 class ResourceMonitor:
@@ -80,7 +84,9 @@ class ResourceMonitor:
             return "page"
         if resource_type == "image" and "/images/" in path:
             return "image"
-        if resource_type == "font" or path.endswith((".woff", ".woff2", ".ttf", ".otf")):
+        if "/webpack/" not in path and (
+            resource_type == "font" or path.endswith((".woff", ".woff2", ".ttf", ".otf"))
+        ):
             return "font"
         return None
 
@@ -168,7 +174,15 @@ async def wait_for_manager(page: Page, timeout_seconds: float = 60) -> dict[str,
     deadline = asyncio.get_running_loop().time() + timeout_seconds
     last_state: dict[str, Any] = {}
     while asyncio.get_running_loop().time() < deadline:
-        last_state = await page.evaluate(MANAGER_STATE_SCRIPT)
+        try:
+            last_state = await page.evaluate(MANAGER_STATE_SCRIPT)
+        except PlaywrightError as error:
+            detail = str(error)
+            lowered = detail.casefold()
+            if "execution context was destroyed" not in lowered:
+                raise DownloaderError(f"render: Scribd initialization failed: {detail}") from error
+            await asyncio.sleep(0.25)
+            continue
         if last_state.get("pageCount") and not last_state.get("missing"):
             return last_state
         await asyncio.sleep(0.25)
@@ -179,7 +193,13 @@ async def wait_for_manager(page: Page, timeout_seconds: float = 60) -> dict[str,
 async def wait_for_batch(page: Page, start: int, end: int, timeout_seconds: float = 45) -> None:
     deadline = asyncio.get_running_loop().time() + timeout_seconds
     while asyncio.get_running_loop().time() < deadline:
-        if await page.evaluate(BATCH_READY_SCRIPT, {"start": start, "end": end}):
+        try:
+            ready = await page.evaluate(BATCH_READY_SCRIPT, {"start": start, "end": end})
+        except PlaywrightError as error:
+            raise DownloaderError(
+                f"render: pages {start + 1}-{end} readiness failed: {error}"
+            ) from error
+        if ready:
             return
         await asyncio.sleep(0.25)
     raise DownloaderError(f"render: pages {start + 1}-{end} did not finish loading")
@@ -192,7 +212,10 @@ async def render_document(
 ) -> DocumentInfo:
     monitor = ResourceMonitor()
     monitor.attach(page)
-    response = await page.goto(ref.embed_url, wait_until="domcontentloaded", timeout=120_000)
+    try:
+        response = await page.goto(ref.embed_url, wait_until="domcontentloaded", timeout=120_000)
+    except PlaywrightError as error:
+        raise DownloaderError(f"navigation: Scribd navigation failed: {error}") from error
     if response is None or response.status >= 400:
         status = response.status if response else "no response"
         raise DownloaderError(f"navigation: Scribd returned {status}")
@@ -201,12 +224,20 @@ async def render_document(
     batch_size = 8
     for start in range(0, info.page_count, batch_size):
         end = min(start + batch_size, info.page_count)
-        await page.evaluate(LOAD_BATCH_SCRIPT, {"start": start, "end": end})
+        try:
+            await page.evaluate(LOAD_BATCH_SCRIPT, {"start": start, "end": end})
+        except PlaywrightError as error:
+            raise DownloaderError(
+                f"render: pages {start + 1}-{end} loading failed: {error}"
+            ) from error
         await wait_for_batch(page, start, end)
         if progress is not None:
             progress(end, info.page_count)
 
-    await page.evaluate("mw:async () => { await document.fonts.ready; }")
+    try:
+        await page.evaluate("mw:async () => { await document.fonts.ready; }")
+    except PlaywrightError as error:
+        raise DownloaderError(f"render: document fonts failed: {error}") from error
     if monitor.failures:
         failure = monitor.failures[0]
         raise DownloaderError(f"resources: {failure.kind} failed: {failure.detail} ({failure.url})")
@@ -217,16 +248,24 @@ PREPARE_PRINT_SCRIPT = r"""mw:({pageCount}) => {
   const manager = window.docManager;
   const pages = Object.values(manager.pages || {}).filter(Boolean).sort((a, b) => a.pageNum - b.pageNum);
   if (pages.length !== pageCount) throw new Error(`expected ${pageCount} pages, got ${pages.length}`);
-  const sizes = pages.map((page) => {
+  const layouts = pages.map((page) => {
     const rect = page.containerElem.getBoundingClientRect();
-    return [rect.width, rect.height];
+    return {page, width: rect.width, height: rect.height};
   });
-  const width = Math.max(...sizes.map((size) => size[0]));
-  const height = Math.max(...sizes.map((size) => size[1]));
+  const width = Math.max(...layouts.map((layout) => layout.width));
+  const height = Math.max(...layouts.map((layout) => layout.height));
 
   const root = document.createElement("main");
   root.id = "scribd-downloader-pages";
-  for (const page of pages) root.appendChild(page.containerElem);
+  for (const {page, width: pageWidth, height: pageHeight} of layouts) {
+    const element = page.containerElem;
+    element.style.setProperty("box-sizing", "border-box", "important");
+    element.style.setProperty("width", `${pageWidth}px`, "important");
+    element.style.setProperty("height", `${pageHeight}px`, "important");
+    element.style.setProperty("min-width", `${pageWidth}px`, "important");
+    element.style.setProperty("min-height", `${pageHeight}px`, "important");
+    root.appendChild(element);
+  }
   document.body.replaceChildren(root);
 
   const style = document.createElement("style");
@@ -237,19 +276,38 @@ PREPARE_PRINT_SCRIPT = r"""mw:({pageCount}) => {
       margin: 0 !important; padding: 0 !important; width: ${width}px !important;
       height: auto !important; overflow: visible !important; background: white !important;
     }
-    #scribd-downloader-pages > .outer_page {
+    #scribd-downloader-pages > * {
       display: block !important; position: relative !important;
-      margin: 0 !important; padding: 0 !important;
-      max-width: ${width}px !important; max-height: ${height}px !important;
+      margin: 0 !important;
       break-after: page; page-break-after: always;
-      overflow: hidden !important; box-shadow: none !important;
+      overflow: visible !important; box-shadow: none !important;
     }
-    #scribd-downloader-pages > .outer_page:last-child {
+    #scribd-downloader-pages > *:last-child {
       break-after: auto; page-break-after: auto;
     }
   `;
   document.head.appendChild(style);
-  return {renderedPages: root.children.length, width, height};
+  void root.offsetHeight;
+
+  const layoutFailures = [];
+  const format = (value) => Number.isInteger(value) ? String(value) : value.toFixed(2);
+  for (const {page, width: pageWidth, height: pageHeight} of layouts) {
+    const element = page.containerElem;
+    const rect = element.getBoundingClientRect();
+    if (Math.abs(rect.width - pageWidth) > 0.5 || Math.abs(rect.height - pageHeight) > 0.5) {
+      layoutFailures.push(
+        `page ${page.pageNum} border box changed from ${format(pageWidth)}x${format(pageHeight)} ` +
+        `to ${format(rect.width)}x${format(rect.height)}`
+      );
+    }
+    if (element.scrollWidth > element.clientWidth || element.scrollHeight > element.clientHeight) {
+      layoutFailures.push(
+        `page ${page.pageNum} content ${element.scrollWidth}x${element.scrollHeight} exceeds visible box ` +
+        `${element.clientWidth}x${element.clientHeight}`
+      );
+    }
+  }
+  return {renderedPages: root.children.length, width, height, layoutFailures};
 }"""
 
 
@@ -260,3 +318,5 @@ async def prepare_print_dom(page: Page, info: DocumentInfo) -> None:
         raise DownloaderError(f"print DOM: {error}") from error
     if result["renderedPages"] != info.page_count:
         raise DownloaderError("print DOM: page count changed during preparation")
+    if result.get("layoutFailures"):
+        raise DownloaderError(f"print DOM: {result['layoutFailures'][0]}")
