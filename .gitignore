@@ -1,1 +1,9 @@
 .worktrees/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+dist/
+*.egg-info/
+*.pdf
+.scribd-downloader/
